@@ -1,4 +1,4 @@
-Just a credit doc to keep track of where I got the code from and give credit where it is due.
+Just a credit doc to keep track of where I got code from and give credit where it is due.
 
 Adapted code from the following sources:
 https://github.com/daveshap/PineconeInfiniteMemoryChatbot
