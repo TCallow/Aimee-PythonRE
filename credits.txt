@@ -1,4 +1,5 @@
 Just a credit doc to keep track of where I got code from and give credit where it is due.
 
-Adapted code from the following sources:
+Adapted code for chatbot functionality from the following source:
 https://github.com/daveshap/PineconeInfiniteMemoryChatbot
+
