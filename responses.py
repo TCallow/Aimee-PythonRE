@@ -5,13 +5,17 @@ import re
 from time import time, sleep
 from uuid import uuid4
 
+from dotenv import load_dotenv
 from google.cloud import language_v1
+from google.cloud import texttospeech
 
 import openai
 import pinecone
-
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "careful-voyage-380603-675da19bbd85.json"
 credentials = 'careful-voyage-380603-675da19bbd85.json'
 client = language_v1.LanguageServiceClient.from_service_account_json(credentials)
+tts_client = texttospeech.TextToSpeechClient()
+load_dotenv()
 
 
 # The next 4 methods are for loading and saving files.
@@ -40,6 +44,14 @@ def timestamp_to_datetime(unix_time):
     return datetime.datetime.fromtimestamp(unix_time).strftime("%A, %B %d, %Y at %I:%M%p %Z")
 
 
+def generate_speech(text):
+    response = tts_client.synthesize_speech(
+        input={'text': text},
+        voice={'language_code': 'en-US', 'ssml_gender': 'NEUTRAL'},
+        audio_config={'audio_encoding': 'MP3'}
+    )
+    return response.audio_content
+
 # Creates embeddings for the message and the response.
 def gpt3_embedding(content, engine='text-embedding-ada-002'):
     content = content.encode(encoding='ASCII', errors='ignore').decode()  # fix any UNICODE errors
@@ -49,7 +61,7 @@ def gpt3_embedding(content, engine='text-embedding-ada-002'):
 
 
 # Generates a response using GPT-3.
-def gpt3_completion(prompt, engine='text-davinci-003', temp=2.0, top_p=1.0, tokens=400, freq_pen=1.0, pres_pen=0.5,
+def gpt3_completion(prompt, engine='text-davinci-003', temp=0.9, top_p=1.0, tokens=400, freq_pen=2.0, pres_pen=2.0,
                     stop=None):
     if stop is None:
         stop = ['USER:', 'AIMEE:']
@@ -94,13 +106,6 @@ def load_conversation(results):
     return '\n'.join(messages).strip()
 
 
-# Analyzes the sentiment of the message using Google Natural Language API.
-def analyze_sentiment(message):
-    document = language_v1.Document(content=message, type_=language_v1.Document.Type.PLAIN_TEXT)
-    sentiment = client.analyze_sentiment(request={'document': document}).document_sentiment
-    return sentiment.score
-
-
 # Gets the Pinecone index.
 def get_index():
     pinecone.init(api_key=open_file('key_pinecone.txt'), environment='us-west4-gcp')
@@ -110,13 +115,11 @@ def get_index():
 
 # This is the main method that generates a response and creates embeddings. It returns the bots response.
 def response_and_index(message, author) -> str:
-    pinecone.init(api_key=open_file('key_pinecone.txt'), environment='us-west4-gcp')
-    sentiment_score = analyze_sentiment(message)
+    pinecone.init(api_key=os.getenv('PINECONE_KEY'), environment=os.getenv('PINECONE_ENV'))
     print('on_message called!')
     convo_length = 30
-    openai.api_key = open_file('key_openai.txt')
+    openai.api_key = os.getenv('OPENAI_KEY')
     print('open api key found')
-    pinecone.init(api_key=open_file('key_pinecone.txt'), environment='us-west4-gcp')
     print('pinecone key found')
     vdb = pinecone.Index("aimee")
     print('index selected')
@@ -140,7 +143,7 @@ def response_and_index(message, author) -> str:
     conversation = load_conversation(results)
     print('conversation loaded')
     prompt = open_file('prompt_response.txt').replace('<<CONVERSATION>>', conversation).replace('<<MESSAGE>>', message) \
-        .replace('<<USER>>', author).replace('<<SCORE>>', str(sentiment_score))
+        .replace('<<USER>>', author)
     print('prompt created')
     print(prompt)
 

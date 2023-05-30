@@ -1,31 +1,36 @@
 import io
 import json
 import os
+import random
 import re
+import sqlite3
 
 import asyncio
 import discord
+import pvporcupine
+import shortuuid
 import wavelink
 from discord.ext import commands
 from dotenv import load_dotenv
-
-import sqlite3
-import random
-import socketio
-import shortuuid
+from google.cloud import texttospeech
 
 import music
-import xivResponses
 import responses
+import xivResponses
 
 load_dotenv()
-
+porcupin = pvporcupine.create(
+    access_key=os.getenv('LEOPARD_TOKEN'),
+    keyword_paths=['Hey-Aimee_en_windows_v2_2_0.ppn']
+)
 intents = discord.Intents.default()
 intents.message_content = True
 client = commands.Bot(command_prefix='!', intents=intents)
+tts_client = texttospeech.TextToSpeechClient()
 database = sqlite3.connect('quotes.db')
 cursor = database.cursor()
-database.execute('CREATE TABLE IF NOT EXISTS quotes (quote STRING, author STRING, server_id INT, unique_id STRING)')
+database.execute('CREATE TABLE IF NOT EXISTS susquotesdisabled (server_id TEXT)')
+user = ""
 
 
 async def send_message(message, user_message, is_private):
@@ -60,19 +65,28 @@ async def is_mod(member: discord.Member) -> bool:
     return member.guild_permissions.manage_messages
 
 
-async def connect_to_dalai():
-    sio = socketio.AsyncClient()
-    try:
-        await sio.connect('http://localhost:3000')
-        print('Connected to Dalai server')
-        dalai_connected = True
-    except Exception as e:
-        print(f'Failed to connect to Dalai server: {e}')
-        dalai_connected = False
+def remove_word(string, word):
+    # Check if the word is present in string
+    if word in string:
+        # To cover the case if the word is at the beginning
+        # of the string or anywhere in the middle
+        temp_word = word + " "
+        string = string.replace(temp_word, "")
+
+        # To cover the edge case if the word is at the end
+        # of the string
+        temp_word = " " + word
+        string = string.replace(temp_word, "")
+
+    # Return the resultant string
+    return string
 
 
 def run_discord_bot():
     token = os.getenv('DISCORD_TOKEN')
+    porcupine = None
+    pa = None
+    audio_stream = None
 
     @client.event
     async def on_ready():
@@ -81,11 +95,6 @@ def run_discord_bot():
         client.loop.create_task(music.on_node())
         responses.bot_user_ID = client.user.id
         await client.change_presence(activity=activity, status=discord.Status.online)
-
-        try:
-            await connect_to_dalai()
-        except Exception as e:
-            print(f'Failed to connect to Dalai server: {e}')
 
         try:
             synced = await client.tree.sync()
@@ -122,10 +131,12 @@ def run_discord_bot():
             await ctx.followup.send('Your search is too broad... maybe try again with a more specific query?')
 
     @client.tree.command(name='quote', description='Adds a quote to the database')
-    async def quote(ctx, *, message: str, author: str):
+    async def quote(ctx, *, message_id: str):
         await ctx.response.defer(ephemeral=False)
+        message = await ctx.channel.fetch_message(message_id)
         unique_id = str(shortuuid.uuid())
-        cursor.execute('INSERT INTO quotes VALUES (?, ?, ?, ?)', (message, author, ctx.guild.id, unique_id))
+        cursor.execute('INSERT INTO quotes VALUES (?, ?, ?, ?)',
+                       (str(message.content), str(message.author), ctx.guild.id, unique_id))
         database.commit()
         await ctx.followup.send('Quote added to the database!')
 
@@ -160,11 +171,11 @@ def run_discord_bot():
         else:
             embed = discord.Embed(title=f'Quotes for {ctx.guild.name}', color=0x00ff00)
             for target_quote in quotes:
-                embed.add_field(name=target_quote[1], value=f'"{target_quote[0]}" \n ID = {target_quote[3]}"',
+                embed.add_field(name=target_quote[1], value=f'"{target_quote[0]}" \n ID: {target_quote[3]}',
                                 inline=False)
             await ctx.followup.send(embed=embed)
 
-    @client.tree.command(name='deletequote', description='Deletes a quote from the database by its ID')
+    @client.tree.command(name='deletequote', description='Deletes a quote from the database by its ID (Moderator only)')
     async def deletequote(ctx, quote_id: str):
         await ctx.response.defer(ephemeral=False)
         if await is_mod(member=ctx.user):
@@ -197,6 +208,23 @@ def run_discord_bot():
         else:
             await vc.play(query)
             await ctx.followup.send(f'Now playing: {vc.current.title}')
+
+    @client.tree.command(name='join', description='join the voice channel you are in')
+    async def join(ctx):
+        await ctx.response.defer(ephemeral=False)
+        guild = client.get_guild(ctx.guild.id)
+        bot_member = guild.get_member(client.user.id)
+        if not ctx.user.voice:
+            return await ctx.followup.send(f'You aren\'t connected to a voice channel {ctx.user.mention}!')
+        elif bot_member.voice and bot_member.voice.channel != ctx.user.voice.channel:
+            await ctx.guild.voice_client.move_to(ctx.user.voice.channel)
+            await ctx.followup.send(f'Moved to {ctx.user.voice.channel}')
+        elif bot_member.voice and bot_member.voice.channel == ctx.user.voice.channel:
+            await ctx.followup.send(f'I\'m already in {ctx.user.voice.channel} {ctx.user.mention}!')
+        else:
+            channel = ctx.user.voice.channel
+            await channel.connect()
+            await ctx.followup.send(f'Joined {channel}!')
 
     @client.tree.command(name='skip', description='Calls a vote to skip the current song')
     async def skip(ctx):
@@ -257,40 +285,123 @@ def run_discord_bot():
                 embed.add_field(name=f'{i + 1}. {track.title}', value=f'Duration: {track.duration}', inline=False)
             await ctx.followup.send(embed=embed)
 
+    @client.tree.command(name='susquotes', description='Enables or disables sus quotes. Enter enable or disable as the '
+                                                       'status. (Moderator only)')
+    async def susquotes(ctx, *, status: str):
+        await ctx.response.defer(ephemeral=False)
+        target_server = ctx.guild.id
+        cursor.execute('SELECT * FROM susquotesdisabled WHERE server_id = ?', (target_server,))
+        status_input = status.lower()
+        if await is_mod(member=ctx.user):
+            if status_input == 'disable':
+                if cursor.fetchone():
+                    await ctx.followup.send('Sus quotes are already disabled!')
+                else:
+                    cursor.execute('INSERT INTO susquotesdisabled VALUES (?)', (target_server,))
+                    database.commit()
+                    await ctx.followup.send('Sus quotes disabled!')
+            elif status_input == 'enable':
+                if cursor.fetchone() is None:
+                    await ctx.followup.send('Sus quotes are already enabled!')
+                else:
+                    cursor.execute('DELETE FROM susquotesdisabled WHERE server_id = ?', (target_server,))
+                    database.commit()
+                    await ctx.followup.send('Sus quotes enabled!')
+
+        else:
+            await ctx.followup.send('Invalid answer, answer with simply enable or disable')
+
+    @client.tree.command(name='speaktext', description='Converts text to speech')
+    async def speaktext(ctx, *, text: str):
+        await ctx.response.defer(ephemeral=False)
+        channel = ctx.user.voice.channel
+        guild = client.get_guild(ctx.guild.id)
+        bot_member = guild.get_member(client.user.id)
+        voice_client = discord.utils.get(client.voice_clients, guild=ctx.guild)
+        if not ctx.user.voice:
+            await ctx.followup.send('You\'re not in a voice channel!')
+            return
+        elif voice_client and voice_client.is_connected():
+            await voice_client.move_to(channel)
+            if voice_client.is_playing():
+                await ctx.followup.send('Already speaking or playing music! Try again later.')
+                return
+            tts_response = responses.generate_speech(text)
+            with open('tts_response.mp3', 'wb') as f:
+                f.write(tts_response)
+
+            voice_client.play(discord.FFmpegPCMAudio('tts_response.mp3'), after=lambda e: os.remove('tts_response.mp3'))
+            await ctx.followup.send(str(ctx.user) + ': ' + text)
+        else:
+            voice_client = await channel.connect()
+            tts_response = responses.generate_speech(text)
+            with open('tts_response.mp3', 'wb') as f:
+                f.write(tts_response)
+
+            voice_client.play(discord.FFmpegPCMAudio('tts_response.mp3'), after=lambda e: os.remove('tts_response.mp3'))
+            await ctx.followup.send(str(ctx.user) + ': ' + text)
+
+    @client.tree.command(name='allcommands', description='Shows a list of commands')
+    async def allcommands(ctx):
+        await ctx.response.defer(ephemeral=False)
+        embed = discord.Embed(title='Commands', color=0x00ff00)
+        for command in client.tree.get_commands():
+            embed.add_field(name=command.name, value=command.description, inline=False)
+        await ctx.followup.send(embed=embed)
+
     @client.event
     async def on_message(message):
         if message.author == client.user:
             return
 
-        username = str(message.author)
+        username = message.author.display_name
         user_message = str(message.content)
         channel = str(message.channel)
+        if 'sus' in user_message and message.guild is not None:
+            server = message.guild.id
+            cursor.execute('SELECT * FROM susquotesdisabled WHERE server_id = ?', (server,))
+            if cursor.fetchone() is None:
+                with open('amongus.json', 'r') as f:
+                    quote = json.load(f)
+                    random_quote = random.choice(quote)
+                await message.channel.send(random_quote)
 
-        if 'sus' in user_message:
-            with open('amongus.json', 'r') as f:
-                quote = json.load(f)
-            random_quote = random.choice(quote)
-            await message.channel.send(random_quote)
-
-        if '@1072402868319047813' in user_message:
-            print(f"{username} said: '{user_message}' in {channel}")
-            return
         if isinstance(message.channel, discord.DMChannel):
             print(f"{username} said: '{user_message}' in DMs")
-            await responses.on_message(message)
+            async with message.channel.typing():
+                cleaned_message = remove_word(user_message, '<@1072402868319047813>')
+                cleaned_username = re.sub(r'[^a-zA-Z0-9]+', '', username)
+                print(f'Cleaned user: {cleaned_username}')
+                response = responses.response_and_index(cleaned_message, cleaned_username)
+                await message.channel.send(response)
+                print(f'Responded in {message.channel} with {response}')
+                return
+        else:
+            if '<@1072402868319047813>' in user_message:
+                print(f"{username} said: '{user_message}' in {channel}")
+                async with message.channel.typing():
+                    cleaned_message = remove_word(user_message, '<@1072402868319047813>')
+                    cleaned_username = re.sub(r'[^a-zA-Z0-9]+', '', username)
+                    print(f'Cleaned user: {cleaned_username}')
+                    response = responses.response_and_index(cleaned_message, cleaned_username)
+                    await message.channel.send(response)
+                    print(f'Responded in {message.channel} in {message.guild} with {response}')
+                    return
 
     @client.event
     async def on_voice_state_update(member, before, after):
-        if after.channel is None:
-            vc: wavelink.Player = member.guild.voice_client
-            if vc is not None:
-                if len(vc.channel.members) == 1:
-                    print(f'No one left in {before.channel} in {member.guild}, disconnecting in 60 seconds...')
-                    await asyncio.sleep(60)
+        nonlocal porcupine, pa, audio_stream
+        if member != client.user:
+            if after.channel is None:
+                vc: wavelink.Player = member.guild.voice_client
+                if vc is not None:
                     if len(vc.channel.members) == 1:
-                        print(f'Disconnected from {before.channel} in {member.guild}.')
-                        await vc.disconnect()
-                    else:
-                        print(f'Someone joined {before.channel} in {member.guild}, not disconnecting.')
+                        print(f'No one left in {before.channel} in {member.guild}, disconnecting in 60 seconds...')
+                        await asyncio.sleep(60)
+                        if len(vc.channel.members) == 1:
+                            print(f'Disconnected from {before.channel} in {member.guild}.')
+                            await vc.disconnect()
+                        else:
+                            print(f'Someone joined {before.channel} in {member.guild}, not disconnecting.')
 
     client.run(token)
